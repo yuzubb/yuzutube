@@ -590,6 +590,11 @@ async function initWatchPage(videoId) {
   fetchJSON(`/proxy/related/${encodeURIComponent(videoId)}?limit=15`).then(data => {
     const entries = data.entries || [];
     relatedBox.innerHTML = entries.length ? entries.map(relatedCardHTML).join("") : '<div class="empty-state">関連動画はありません</div>';
+    // 動画終了時の「次のおすすめ」オーバーレイ用に、動画カード(再生リスト/チャンネル
+    // カードは除く)だけを候補として持たせておく。取得タイミングが動画再生開始より
+    // 遅れることがあるため、playerWrap側のプロパティとして後付けで渡している
+    // (wireCustomPlayerControlsのendedイベント発火時に、その時点の最新の値を見る)。
+    playerWrap._nextUpCandidates = entries.filter(e => e.video_id && (!e.entry_type || e.entry_type === "video"));
   }).catch(e => showError(relatedBox, e.message));
   fetchJSON(`/proxy/comments/${encodeURIComponent(videoId)}?limit=30`).then(data => {
     const comments = data.comments || [];
@@ -1094,7 +1099,11 @@ function renderPlayer(wrap, stream, info) {
   } else if (hlsUrl) {
     attachHlsSource(videoEl, hlsUrl);
   }
-  wireCustomPlayerControls(videoEl, playerRoot, syncState, playlistContext, videoId, isLive);
+  wireCustomPlayerControls(videoEl, playerRoot, syncState, playlistContext, videoId, isLive, wrap, {
+    title: info.title || "",
+    channel: info.channel || info.uploader || "",
+    thumbnail: info.thumbnail || "",
+  });
 
   // ---------- 歯車メニュー ----------
   const settingsBtn = document.getElementById("settingsBtn");
@@ -1351,7 +1360,74 @@ function formatPlayerTime(sec) {
   return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
-function wireCustomPlayerControls(videoEl, playerRoot, syncState, playlistContext, currentVideoId, isLive) {
+const UP_NEXT_COUNTDOWN_SECONDS = 5;
+
+function showUpNextOverlay(wrap, nextVideo, autoplayEnabled) {
+  if (!wrap) return;
+  // 既に表示中なら重ねて表示しない
+  if (wrap.querySelector(".up-next-overlay")) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "up-next-overlay";
+  overlay.innerHTML = `
+    <div class="up-next-card">
+      <a class="up-next-thumb-link" href="/watch?v=${encodeURIComponent(nextVideo.video_id)}">
+        ${nextVideo.thumbnail ? `<img class="up-next-thumb" src="${escapeHtml(nextVideo.thumbnail)}" alt="">` : ""}
+      </a>
+      <div class="up-next-body">
+        <div class="up-next-label">${autoplayEnabled ? "次の動画を自動再生します" : "次の動画"}</div>
+        <a class="up-next-title" href="/watch?v=${encodeURIComponent(nextVideo.video_id)}">${escapeHtml(truncateText(nextVideo.title || "", 80))}</a>
+        <div class="up-next-channel">${escapeHtml(nextVideo.channel || "")}</div>
+        <div class="up-next-actions">
+          <button type="button" class="up-next-play-btn" id="upNextPlayBtn">
+            ${autoplayEnabled ? `<svg class="up-next-ring" viewBox="0 0 36 36"><circle class="up-next-ring-bg" cx="18" cy="18" r="16"></circle><circle class="up-next-ring-fg" id="upNextRingFg" cx="18" cy="18" r="16"></circle></svg><span id="upNextCountdownLabel">${UP_NEXT_COUNTDOWN_SECONDS}</span>` : "今すぐ再生"}
+          </button>
+          ${autoplayEnabled ? `<button type="button" class="up-next-cancel-btn" id="upNextCancelBtn">キャンセル</button>` : ""}
+        </div>
+      </div>
+    </div>`;
+  wrap.appendChild(overlay);
+
+  const playNow = () => {
+    window.location.href = `/watch?v=${encodeURIComponent(nextVideo.video_id)}`;
+  };
+  const playBtn = overlay.querySelector("#upNextPlayBtn");
+  if (playBtn) playBtn.addEventListener("click", playNow);
+
+  if (!autoplayEnabled) return;
+
+  const cancelBtn = overlay.querySelector("#upNextCancelBtn");
+  const ringFg = overlay.querySelector("#upNextRingFg");
+  const countdownLabel = overlay.querySelector("#upNextCountdownLabel");
+  const circumference = 2 * Math.PI * 16;
+  if (ringFg) {
+    ringFg.style.strokeDasharray = `${circumference}`;
+    ringFg.style.strokeDashoffset = "0";
+  }
+
+  let remaining = UP_NEXT_COUNTDOWN_SECONDS;
+  const intervalId = setInterval(() => {
+    remaining -= 1;
+    if (countdownLabel) countdownLabel.textContent = String(Math.max(remaining, 0));
+    if (ringFg) {
+      const progress = 1 - remaining / UP_NEXT_COUNTDOWN_SECONDS;
+      ringFg.style.strokeDashoffset = String(circumference * progress);
+    }
+    if (remaining <= 0) {
+      clearInterval(intervalId);
+      playNow();
+    }
+  }, 1000);
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", () => {
+      clearInterval(intervalId);
+      overlay.remove();
+    });
+  }
+}
+
+function wireCustomPlayerControls(videoEl, playerRoot, syncState, playlistContext, currentVideoId, isLive, wrap, mediaInfo) {
   // ループ再生・自動再生は、この関数の他の処理(画質/字幕まわり等)で万一エラーが
   // 起きても巻き込まれて動かなくなることが無いよう、あえて一番最初に配線しておく。
   const LOOP_KEY = "tubely_loop_enabled";
@@ -1402,6 +1478,16 @@ function wireCustomPlayerControls(videoEl, playerRoot, syncState, playlistContex
           window.location.href = `/watch?v=${encodeURIComponent(nextVideo.video_id)}&list=my:${playlistContext.playlistId}&index=${nextIndex}`;
         })
         .catch(() => {});
+    });
+  } else {
+    // プレイリスト再生でない、単発の動画の場合は、YouTube本家おなじみの
+    // 「次のおすすめ」オーバーレイを表示する(関連動画から1本を提案し、
+    // 自動再生がオンならカウントダウン後に自動で移動する)。
+    videoEl.addEventListener("ended", () => {
+      const candidates = (wrap && wrap._nextUpCandidates) || [];
+      const nextVideo = candidates[0];
+      if (!nextVideo) return;
+      showUpNextOverlay(wrap, nextVideo, autoplayEnabled);
     });
   }
 
@@ -1606,6 +1692,177 @@ function wireCustomPlayerControls(videoEl, playerRoot, syncState, playlistContex
 
   videoEl.addEventListener("play", showControls);
   showControls();
+
+  // ---------- キーボードショートカット(本家YouTube風) ----------
+  // 入力欄(検索・コメント欄等)にフォーカスがある時にスペースキー等が反応すると
+  // 文字入力の邪魔になるため、そういう時は無視する。動画プレイヤーがページ内に
+  // 複数存在することは無い前提で、documentレベルで拾う(本家もそう)。
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+  }
+
+  function seekRelative(seconds) {
+    const newTime = Math.max(0, Math.min(videoEl.duration || Infinity, videoEl.currentTime + seconds));
+    videoEl.currentTime = newTime;
+    if (syncState.audioEl) syncState.audioEl.currentTime = newTime;
+  }
+
+  // ---------- ロック画面・コントロールセンターへの表示(Media Session API) ----------
+  // タイトル・チャンネル名・サムネイルを表示し、そこから再生/一時停止/シークを
+  // 操作できるようにする。ロック画面に「表示される」こと自体はこれで実現できるが、
+  // 「バックグラウンド(画面ロック中)でも動画再生が途切れず続く」かどうかは、
+  // iOS Safari側の仕様に左右され、Media Session APIだけでは保証できない
+  // (Picture-in-Picture中は継続しやすいが、それ以外は機種・iOSのバージョンに
+  // よって挙動が変わる)。
+  if (mediaInfo && "mediaSession" in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: mediaInfo.title || "",
+        artist: mediaInfo.channel || "",
+        artwork: mediaInfo.thumbnail ? [
+          { src: mediaInfo.thumbnail, sizes: "512x512", type: "image/jpeg" },
+        ] : [],
+      });
+
+      navigator.mediaSession.setActionHandler("play", () => {
+        videoEl.play().catch(() => {});
+        if (syncState.audioEl) syncState.audioEl.play().catch(() => {});
+      });
+      navigator.mediaSession.setActionHandler("pause", () => {
+        videoEl.pause();
+        if (syncState.audioEl) syncState.audioEl.pause();
+      });
+      navigator.mediaSession.setActionHandler("seekbackward", (details) => {
+        seekRelative(-(details.seekOffset || 10));
+      });
+      navigator.mediaSession.setActionHandler("seekforward", (details) => {
+        seekRelative(details.seekOffset || 10);
+      });
+      // プレイリスト再生でない場合は前後の動画が無いので、ハンドラ自体を
+      // 設定しない(本家も、次が無い時はボタンをグレーアウトさせている)。
+      if (playlistContext) {
+        navigator.mediaSession.setActionHandler("previoustrack", () => {
+          if (playlistContext.index <= 0) return;
+          fetch(`/proxy/playlists/${playlistContext.playlistId}`)
+            .then((res) => res.json())
+            .then((data) => {
+              const videos = data.videos || [];
+              const prevIndex = playlistContext.index - 1;
+              const prevVideo = videos[prevIndex];
+              if (!prevVideo) return;
+              window.location.href = `/watch?v=${encodeURIComponent(prevVideo.video_id)}&list=my:${playlistContext.playlistId}&index=${prevIndex}`;
+            })
+            .catch(() => {});
+        });
+        navigator.mediaSession.setActionHandler("nexttrack", () => {
+          fetch(`/proxy/playlists/${playlistContext.playlistId}`)
+            .then((res) => res.json())
+            .then((data) => {
+              const videos = data.videos || [];
+              const nextIndex = playlistContext.index + 1;
+              const nextVideo = videos[nextIndex];
+              if (!nextVideo) return;
+              window.location.href = `/watch?v=${encodeURIComponent(nextVideo.video_id)}&list=my:${playlistContext.playlistId}&index=${nextIndex}`;
+            })
+            .catch(() => {});
+        });
+      }
+
+      videoEl.addEventListener("play", () => { navigator.mediaSession.playbackState = "playing"; });
+      videoEl.addEventListener("pause", () => { navigator.mediaSession.playbackState = "paused"; });
+    } catch (e) {
+      // Media Session自体が使えない/失敗しても、通常の再生には影響させない
+    }
+  }
+
+  function changeVolume(delta) {
+    const newVolume = Math.max(0, Math.min(1, videoEl.volume + delta));
+    videoEl.volume = newVolume;
+    videoEl.muted = newVolume === 0;
+    if (volumeBar) volumeBar.value = Math.round(newVolume * 100);
+    if (syncState.audioEl) {
+      syncState.audioEl.volume = newVolume;
+      syncState.audioEl.muted = videoEl.muted;
+    }
+    if (muteBtn) muteBtn.innerHTML = videoEl.muted || newVolume === 0 ? icon("volumeMute") : icon("volume");
+  }
+
+  function handlePlayerKeydown(e) {
+    if (isTypingTarget(document.activeElement)) return;
+    // 動画プレイヤー自体がページに存在しない状態(要素が消えた等)では何もしない
+    if (!document.body.contains(videoEl)) return;
+
+    switch (e.key) {
+      case " ":
+      case "k":
+      case "K":
+        e.preventDefault();
+        if (videoEl.paused) {
+          videoEl.play().catch(() => {});
+          if (syncState.audioEl) syncState.audioEl.play().catch(() => {});
+        } else {
+          videoEl.pause();
+          if (syncState.audioEl) syncState.audioEl.pause();
+        }
+        break;
+      case "ArrowLeft":
+      case "j":
+      case "J":
+        e.preventDefault();
+        seekRelative(e.key === "j" || e.key === "J" ? -10 : -5);
+        break;
+      case "ArrowRight":
+      case "l":
+      case "L":
+        e.preventDefault();
+        seekRelative(e.key === "l" || e.key === "L" ? 10 : 5);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        changeVolume(0.05);
+        break;
+      case "ArrowDown":
+        e.preventDefault();
+        changeVolume(-0.05);
+        break;
+      case "m":
+      case "M":
+        e.preventDefault();
+        if (muteBtn) muteBtn.click();
+        break;
+      case "f":
+      case "F":
+        e.preventDefault();
+        if (fullscreenBtn) fullscreenBtn.click();
+        break;
+      case "Home":
+        e.preventDefault();
+        videoEl.currentTime = 0;
+        if (syncState.audioEl) syncState.audioEl.currentTime = 0;
+        break;
+      case "End":
+        e.preventDefault();
+        if (videoEl.duration) {
+          videoEl.currentTime = videoEl.duration;
+          if (syncState.audioEl) syncState.audioEl.currentTime = videoEl.duration;
+        }
+        break;
+      default:
+        // 0〜9キーで、動画の0%〜90%地点にジャンプ(本家と同じ挙動)
+        if (/^[0-9]$/.test(e.key) && videoEl.duration && !isLive) {
+          e.preventDefault();
+          const pct = parseInt(e.key, 10) / 10;
+          const t = videoEl.duration * pct;
+          videoEl.currentTime = t;
+          if (syncState.audioEl) syncState.audioEl.currentTime = t;
+        }
+        break;
+    }
+  }
+
+  document.addEventListener("keydown", handlePlayerKeydown);
 }
 
 const CHANNEL_TABS = [ {
